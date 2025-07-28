@@ -5,7 +5,7 @@ from torch import nn
 import torch
 from einops import einsum
 
-class Linear(nn.Module):
+class MyLinear(nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):
         """
         构造线性变换模块。
@@ -19,18 +19,12 @@ class Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.device = device
-        self.dtype = dtype
+        self.dtype = dtype if dtype is not None else torch.float32
         self.weight = nn.Parameter(
             torch.empty((out_features, in_features), device=device, dtype=dtype)
         )
-        self.bias = nn.Parameter(
-            torch.empty(out_features, device=device, dtype=dtype)
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
-        nn.init.zeros_(self.bias)
+        std = (2 / (in_features + out_features)) ** 0.5
+        nn.init.trunc_normal_(self.weight, 0, std, -3 * std, 3 * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -40,7 +34,33 @@ class Linear(nn.Module):
         返回:
             torch.Tensor: 线性变换后的张量
         """
-        return einsum(X, D, D1)
+        return einsum(self.weight, x,"d_out d_in, ... d_in -> ... d_out")
+
+
+class MyEmbedding(nn.Module):
+
+    def __init__(self, vocab_size, d_model, device=None, dtype=None):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.device = device
+        self.dtype = dtype if dtype is not None else torch.float32
+        self.weight = nn.Parameter(torch.empty((vocab_size, d_model), device=self.device, dtype=self.dtype))
+        nn.init.trunc_normal_(self.weight, 0, 1, -3, 3)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        根据token IDs从嵌入矩阵中选择对应的嵌入向量。
+        参数:
+            token_ids (torch.Tensor): 形状为 (batch_size, sequence_length) 的token ID张量
+        返回:
+            torch.Tensor: 形状为 (batch_size, sequence_length, d_model) 的嵌入向量张量
+        """
+        # 使用索引操作从嵌入矩阵中选择对应的嵌入向量
+        # self.weight 的形状是 (vocab_size, d_model)
+        # token_ids 的形状是 (batch_size, sequence_length)
+        # 结果形状将是 (batch_size, sequence_length, d_model)
+        return self.weight[token_ids]
 
 
 
@@ -81,3 +101,9 @@ def rmsnorm(
 def silu(x: torch.Tensor):
 
     return torch.sigmoid(x) * x
+
+
+def softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
+    in_features = in_features - in_features.max(dim=dim, keepdim=True)[0]
+    exp_in_features = torch.exp(in_features)
+    return exp_in_features / exp_in_features.sum(dim=dim, keepdim=True)

@@ -1,6 +1,8 @@
 import os
 import regex as re
 from collections import defaultdict, Counter
+from typing import Iterable, Iterator
+import pickle
 
 def train_bpe(
     input_path: str | os.PathLike,
@@ -112,5 +114,156 @@ def train_bpe(
     return vocab, merges
 
 
+
+
+class Tokenizer:
+    def __init__(self, vocab, merges, special_tokens=None):
+
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens
+
+    @classmethod
+    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
+        with open(vocab_filepath, "rb") as f:
+            vocab = pickle.load(f)
+        with open(merges_filepath, "rb") as f:
+            merges = pickle.load(f)
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        """Encode an input text into a sequence of token IDs."""
+        # 步骤1: 预分词 - 使用与训练时相同的正则表达式
+        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        
+        # 如果有特殊token，先处理特殊token
+        if self.special_tokens:
+            # 按特殊token分割文本，优先匹配最长的token
+            # 按长度降序排序特殊token
+            sorted_special_tokens = sorted(self.special_tokens, key=len, reverse=True)
+            pattern = "|".join(re.escape(token) for token in sorted_special_tokens)
+            
+            # 找到所有特殊token的位置
+            special_token_positions = []
+            for match in re.finditer(pattern, text):
+                special_token_positions.append((match.start(), match.end(), match.group()))
+            
+            # 按位置排序
+            special_token_positions.sort()
+            
+            # 重新构建文本和特殊token序列
+            result_ids = []
+            current_pos = 0
+            
+            for start, end, special_token in special_token_positions:
+                # 处理特殊token之前的文本
+                if start > current_pos:
+                    normal_text = text[current_pos:start]
+                    result_ids.extend(self._encode_normal_text(normal_text))
+                
+                # 添加特殊token的ID
+                special_token_id = self._get_special_token_id(special_token)
+                if special_token_id is not None:
+                    result_ids.append(special_token_id)
+                
+                current_pos = end
+            
+            # 处理最后剩余的文本
+            if current_pos < len(text):
+                normal_text = text[current_pos:]
+                result_ids.extend(self._encode_normal_text(normal_text))
+            
+            return result_ids
+        else:
+            return self._encode_normal_text(text)
+    
+    def _encode_normal_text(self, text: str) -> list[int]:
+        """编码普通文本（不包含特殊token）"""
+        # 预分词
+        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        pre_tokens = re.findall(PAT, text)
+        
+        result_ids = []
+        for pre_token in pre_tokens:
+            # 将预分词转换为字节序列
+            pre_token_bytes = pre_token.encode('utf-8')
+            tokens = [bytes([b]) for b in pre_token_bytes]
+            
+            # 应用BPE合并规则
+            for pair in self.merges:
+                new_tokens = []
+                i = 0
+                while i < len(tokens):
+                    if (i < len(tokens) - 1 and 
+                        tokens[i] == pair[0] and 
+                        tokens[i + 1] == pair[1]):
+                        new_tokens.append(pair[0] + pair[1])
+                        i += 2
+                    else:
+                        new_tokens.append(tokens[i])
+                        i += 1
+                tokens = new_tokens
+            
+            # 将token转换为ID
+            for token in tokens:
+                token_id = self._get_token_id(token)
+                result_ids.append(token_id)
+        
+        return result_ids
+    
+    def _get_token_id(self, token: bytes) -> int:
+        """获取token对应的ID"""
+        for token_id, vocab_token in self.vocab.items():
+            if vocab_token == token:
+                return token_id
+        # 如果token不在词汇表中，按字节处理
+        if len(token) == 1:
+            return token[0]
+        else:
+            # 对于多字节token，按字节分解
+            result = []
+            for byte in token:
+                result.append(byte)
+            return result[0] if result else 0
+    
+    def _get_special_token_id(self, special_token: str) -> int | None:
+        """获取特殊token的ID"""
+        if self.special_tokens and special_token in self.special_tokens:
+            # 在词汇表中查找特殊token
+            special_token_bytes = special_token.encode('utf-8')
+            for token_id, vocab_token in self.vocab.items():
+                if vocab_token == special_token_bytes:
+                    return token_id
+        return None
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """Given an iterable of strings (e.g., a Python file handle), return a generator that lazily yields token IDs. This is
+        required for memory-efficient tokenization of large files that we cannot directly load into
+        memory."""
+        for text in iterable:
+            token_ids = self.encode(text)
+            for token_id in token_ids:
+                yield token_id
+
+    def decode(self, ids: list[int]) -> str:
+        """Decode a sequence of token IDs into text"""
+        # 将ID转换为token
+        tokens = []
+        for token_id in ids:
+            if token_id in self.vocab:
+                tokens.append(self.vocab[token_id])
+            else:
+                # 如果ID不在词汇表中，按字节处理
+                tokens.append(bytes([token_id]))
+        
+        # 合并所有token的字节
+        result_bytes = b''.join(tokens)
+        
+        # 解码为字符串
+        try:
+            return result_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            # 如果解码失败，使用错误处理
+            return result_bytes.decode('utf-8', errors='replace')
 
 
