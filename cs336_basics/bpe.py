@@ -1,29 +1,6 @@
 import os
 import regex as re
 from collections import defaultdict, Counter
-import cppyy
-
-# 定义简单的C++函数来优化pair频率统计
-cppyy.cppdef("""
-#include <map>
-#include <string>
-
-std::map<std::string, int> count_pairs_cpp(const std::map<std::string, int>& word_freqs) {
-    std::map<std::string, int> pair_freqs;
-    
-    for (const auto& word_pair : word_freqs) {
-        const std::string& word = word_pair.first;
-        int freq = word_pair.second;
-        
-        for (size_t i = 0; i < word.length() - 1; ++i) {
-            std::string pair = word.substr(i, 2);
-            pair_freqs[pair] += freq;
-        }
-    }
-    
-    return pair_freqs;
-}
-""")
 
 def train_bpe(
     input_path: str | os.PathLike,
@@ -31,7 +8,7 @@ def train_bpe(
     special_tokens: list[str],
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """训练BPE tokenizer（使用C++优化）
+    """训练BPE tokenizer
     
     Args:
         input_path: 输入文本文件路径
@@ -72,24 +49,22 @@ def train_bpe(
         vocab[next_id] = token.encode('utf-8')
         next_id += 1
     
-    # 将每个word转换为字节序列
-    word_bytes = {}
-    for word in word_freqs:
-        word_bytes[word] = word.encode('utf-8')
-    
-    # 初始化每个word的字节序列
+    # 将每个word转换为字节序列并初始化token列表
     word_tokens = {}
     for word, freq in word_freqs.items():
-        word_tokens[word] = [bytes([b]) for b in word_bytes[word]]
+        word_bytes = word.encode('utf-8')
+        word_tokens[word] = [bytes([b]) for b in word_bytes]
     
     # BPE合并算法
     merges = []
     
     while len(vocab) < vocab_size:
-        # 统计所有相邻字节对的频率
+        # 统计所有相邻字节对的频率 - 优化版本
         pair_freqs = defaultdict(int)
         for word, freq in word_freqs.items():
             tokens = word_tokens[word]
+            if len(tokens) < 2:
+                continue
             for i in range(len(tokens) - 1):
                 pair = (tokens[i], tokens[i + 1])
                 pair_freqs[pair] += freq
@@ -108,13 +83,25 @@ def train_bpe(
         vocab[next_id] = new_token
         next_id += 1
         
-        # 更新所有words中的pair
-        for word in list(word_tokens.keys()):
+        # 更新所有words中的pair - 进一步优化
+        words_to_update = []
+        for word, tokens in word_tokens.items():
+            if len(tokens) >= 2:
+                # 快速检查是否包含目标pair
+                for i in range(len(tokens) - 1):
+                    if tokens[i] == best_pair[0] and tokens[i + 1] == best_pair[1]:
+                        words_to_update.append(word)
+                        break
+        
+        # 只更新包含目标pair的words
+        for word in words_to_update:
             tokens = word_tokens[word]
             new_tokens = []
             i = 0
             while i < len(tokens):
-                if i < len(tokens) - 1 and tokens[i] == best_pair[0] and tokens[i + 1] == best_pair[1]:
+                if (i < len(tokens) - 1 and 
+                    tokens[i] == best_pair[0] and 
+                    tokens[i + 1] == best_pair[1]):
                     new_tokens.append(new_token)
                     i += 2
                 else:
