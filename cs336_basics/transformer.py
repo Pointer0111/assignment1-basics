@@ -6,6 +6,7 @@ import torch
 import math
 from einops import einsum
 
+
 class MyLinear(nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):
         """
@@ -281,7 +282,7 @@ def multihead_self_attention_with_rope(
 
     # 应用RoPE
     if token_positions is not None:
-        max_seq_len = token_positions.max().item() + 1
+        max_seq_len = max_seq_len
         rope = RotaryPositionalEmbedding(
             theta=theta,
             d_k=d_kh,
@@ -318,27 +319,92 @@ def multihead_self_attention_with_rope(
          "d_model d_v, ... sequence_length d_v -> ... sequence_length d_model")
 
 
-def transformer_block(
-    d_model: int,
-    num_heads: int,
-    d_ff: int,
-    max_seq_len: int,
-    theta: float,
-    weights: dict[str, Tensor],
-    in_features: Float[Tensor, " batch sequence_length d_model"],
-) -> Float[Tensor, " batch sequence_length d_model"]:
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float, weights: dict[str, Tensor]):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+        self.weights = weights
+    
+    def forward(self, x: Float[Tensor, " batch sequence_length d_model"]) -> Float[Tensor, " batch sequence_length d_model"]:
+        batch_size, seq_len, _ = x.shape
+        token_positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
+        token_positions = token_positions.unsqueeze(0).expand(batch_size, -1)
+
+        y = x + multihead_self_attention_with_rope(self.d_model, 
+            self.num_heads, self.max_seq_len, self.theta, 
+            self.weights["attn.q_proj.weight"], 
+            self.weights["attn.k_proj.weight"], 
+            self.weights["attn.v_proj.weight"], 
+            self.weights["attn.output_proj.weight"], 
+            rmsnorm(self.d_model, 1e-5, self.weights["ln1.weight"], x), token_positions)
+
+        z = y + swiglu(self.d_model, self.d_ff, 
+            self.weights["ffn.w1.weight"], 
+            self.weights["ffn.w2.weight"], 
+            self.weights["ffn.w3.weight"], 
+            rmsnorm(self.d_model, 1e-5, self.weights["ln2.weight"], y))
+    
+        return z
     
 
+def extract_layer_weights(weights: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
+    """
+    从完整的权重字典中提取指定层的权重。
+    
+    参数:
+        weights (dict[str, Tensor]): 完整的权重字典
+        layer_idx (int): 层索引
+        
+    返回:
+        dict[str, Tensor]: 该层对应的权重字典
+    """
+    layer_weights = {}
+    layer_prefix = f"layers.{layer_idx}."
+    
+    # 提取该层的所有权重
+    for key, value in weights.items():
+        if key.startswith(layer_prefix):
+            # 移除层前缀，保持原有的键名结构
+            new_key = key[len(layer_prefix):]
+            layer_weights[new_key] = value
+    
+    return layer_weights
 
+class TransformerLM(nn.Module):
+    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, num_heads: int, d_ff: int, rope_theta: float, weights: dict[str, Tensor]):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.ln_final_weight = weights["ln_final.weight"]
 
-def transformer_lm(
-    vocab_size: int,
-    context_length: int,
-    d_model: int,
-    num_layers: int,
-    num_heads: int,
-    d_ff: int,
-    rope_theta: float,
-    weights: dict[str, Tensor],
-    in_indices: Int[Tensor, " batch_size sequence_length"],
-) -> Float[Tensor, " batch_size sequence_length vocab_size"]:
+        # 为每一层提取对应的权重
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta, extract_layer_weights(weights, i)) 
+            for i in range(num_layers)
+        ])
+        
+        # 创建token embeddings并赋值权重
+        self.token_embeddings = MyEmbedding(vocab_size, d_model, device=weights["token_embeddings.weight"].device, dtype=weights["token_embeddings.weight"].dtype)
+        self.token_embeddings.weight.data = weights["token_embeddings.weight"]
+        
+        
+        # 创建语言模型头并赋值权重
+        self.lm_head = MyLinear(d_model, vocab_size, device=weights["lm_head.weight"].device, dtype=weights["lm_head.weight"].dtype)
+        self.lm_head.weight.data = weights["lm_head.weight"]
+
+    def forward(self, in_indices: Int[Tensor, " batch_size sequence_length"]) -> Float[Tensor, " batch_size sequence_length vocab_size"]:
+        x = self.token_embeddings(in_indices)
+        for layer in self.layers:
+            x = layer(x)
+        x = rmsnorm(self.d_model, 1e-5, self.ln_final_weight, x) 
+        return self.lm_head(x)
+
