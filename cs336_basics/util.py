@@ -1,8 +1,8 @@
 from jaxtyping import Float, Int
 from torch import Tensor
 import torch
-from typing import Iterable
-
+from typing import Iterable, Optional, Callable
+import math
 
 def cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]) -> Float[Tensor, ""]:
     """Given a tensor of inputs and targets, compute the average cross-entropy
@@ -32,6 +32,60 @@ def cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[
     # 交叉熵损失 = -log_softmax
     return -target_log_softmax.mean()
 
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super(AdamW, self).__init__(params, defaults)
+
+    def step(self, closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]  # 获取学习率
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]  # 获取与参数p相关的状态
+                t = state.get("t", 1)  # 获取迭代次数，默认为1
+                grad = p.grad.data  # 获取梯度
+                m = state.get("m", torch.zeros_like(p.data))  # 获取动量
+                v = state.get("v", torch.zeros_like(p.data))  # 获取速度
+                beta1, beta2 = group["betas"]
+                eps = group["eps"]
+                weight_decay = group["weight_decay"]
+
+                m = beta1 * m + (1 - beta1) * grad
+                v = beta2 * v + (1 - beta2) * grad ** 2
+
+                lr_t = lr * math.sqrt(1 - beta2 ** t) / (1 - beta1 ** t)
+
+
+                p.data -= lr_t * m / (torch.sqrt(v) + eps) 
+                p.data -= lr * weight_decay * p.data
+
+                # 保存状态
+                state["m"] = m
+                state["v"] = v
+                state["t"] = t + 1  # 迭代次数加1
+
+        return loss
+    
+        
+
+
+def get_lr_cosine_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int,
+):
+    if it < warmup_iters:
+        return max_learning_rate * it / warmup_iters
+    elif it <= cosine_cycle_iters:
+        return min_learning_rate + (max_learning_rate - min_learning_rate) * (1 + math.cos(math.pi * (it - warmup_iters) / (cosine_cycle_iters - warmup_iters))) / 2
+    else:
+        return min_learning_rate
 
 
 
