@@ -138,8 +138,8 @@ class RotaryPositionalEmbedding(nn.Module):
         # 预计算sin和cos值
         # 创建位置索引 [0, 1, 2, ..., max_seq_len-1]
         positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
-        # 频率下标
-        freqs = self.theta ** (2 * torch.arange(d_k//2, device=device, dtype=torch.float32) / d_k)
+        # 频率下标 - 正确的RoPE频率计算
+        freqs = self.theta ** (torch.arange(0, d_k, 2, device=device, dtype=torch.float32) / d_k)
         angles = positions[:, None] / freqs[None, :]  # (max_seq_len, d_k//2)
         sin_values = torch.sin(angles)
         cos_values = torch.cos(angles)
@@ -271,20 +271,17 @@ def multihead_self_attention_with_rope(
     V = einsum(v_proj_weight, in_features,
          "d_v d_in, ... sequence_length d_in -> ... sequence_length d_v")
 
-
-    original_shape = Q.shape
-    d_k = original_shape[-1]
-    seq_len = original_shape[-2]
+    d_k = K.shape[-1]
+    seq_len = K.shape[-2]
     d_v = V.shape[-1]
 
     h = num_heads
     d_kh = d_k // h
     d_vh = d_v // h
 
-    max_seq_len = token_positions.max().item() + 1
-
     # 应用RoPE
     if token_positions is not None:
+        max_seq_len = token_positions.max().item() + 1
         rope = RotaryPositionalEmbedding(
             theta=theta,
             d_k=d_kh,
@@ -292,18 +289,26 @@ def multihead_self_attention_with_rope(
             device=in_features.device
         )
 
-        Q = Q.reshape(*Q.shape[:-2], h, seq_len, d_kh)
-        K = K.reshape(*K.shape[:-2], h, seq_len, d_kh)
-        Q = rope(Q, token_positions)
-        K = rope(K, token_positions)
+        # 对每个头分别应用RoPE
+        for i in range(h):
+            # 获取当前头的Q和K
+            q_head = Q[..., i*d_kh:(i+1)*d_kh]
+            k_head = K[..., i*d_kh:(i+1)*d_kh]
+            
+            # 应用RoPE
+            q_head_rope = rope(q_head, token_positions)
+            k_head_rope = rope(k_head, token_positions)
+            
+            # 更新Q和K
+            Q[..., i*d_kh:(i+1)*d_kh] = q_head_rope
+            K[..., i*d_kh:(i+1)*d_kh] = k_head_rope
 
-
-    mask = torch.triu(torch.ones(*original_shape[:-2], seq_len, seq_len), diagonal=1).to(device=Q.device, dtype=torch.bool)
+    mask = torch.triu(torch.ones(*K.shape[:-2], seq_len, seq_len), diagonal=1).to(device=Q.device, dtype=torch.bool)
     attns = []
     for i in range(h):
         attns.append(scaled_dot_product_attention(
-        Q[..., i, :, :], 
-        K[..., i, :, :], 
+        Q[..., i*d_kh: min((i+1)*d_kh, d_k)], 
+        K[..., i*d_kh: min((i+1)*d_kh, d_k)], 
         V[..., i*d_vh: min((i+1)*d_vh, d_v)], 
         mask=~mask))
     
@@ -311,3 +316,29 @@ def multihead_self_attention_with_rope(
 
     return einsum(o_proj_weight, features,
          "d_model d_v, ... sequence_length d_v -> ... sequence_length d_model")
+
+
+def transformer_block(
+    d_model: int,
+    num_heads: int,
+    d_ff: int,
+    max_seq_len: int,
+    theta: float,
+    weights: dict[str, Tensor],
+    in_features: Float[Tensor, " batch sequence_length d_model"],
+) -> Float[Tensor, " batch sequence_length d_model"]:
+    
+
+
+
+def transformer_lm(
+    vocab_size: int,
+    context_length: int,
+    d_model: int,
+    num_layers: int,
+    num_heads: int,
+    d_ff: int,
+    rope_theta: float,
+    weights: dict[str, Tensor],
+    in_indices: Int[Tensor, " batch_size sequence_length"],
+) -> Float[Tensor, " batch_size sequence_length vocab_size"]:
