@@ -1,8 +1,9 @@
-from jaxtyping import Float
+from jaxtyping import Float, Int
 from numpy import dtype
 from torch import Tensor
 from torch import nn
 import torch
+import math
 from einops import einsum
 
 class MyLinear(nn.Module):
@@ -107,3 +108,206 @@ def softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ...
     in_features = in_features - in_features.max(dim=dim, keepdim=True)[0]
     exp_in_features = torch.exp(in_features)
     return exp_in_features / exp_in_features.sum(dim=dim, keepdim=True)
+
+
+def swiglu(
+    d_model: int,
+    d_ff: int,
+    w1_weight: Float[Tensor, " d_ff d_model"],
+    w2_weight: Float[Tensor, " d_model d_ff"],
+    w3_weight: Float[Tensor, " d_ff d_model"],
+    in_features: Float[Tensor, " ... d_model"],
+) -> Float[Tensor, " ... d_model"]:
+
+    w1x = einsum(w1_weight, in_features, "d_ff d_model, ... d_model -> ... d_ff")
+    w3x = einsum(w3_weight, in_features, "d_ff d_model, ... d_model -> ... d_ff")
+
+    output = silu(w1x) * w3x
+
+    return einsum(w2_weight, output, "d_model d_ff, ... d_ff -> ... d_model")
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+        self.device = device
+
+        # 预计算sin和cos值
+        # 创建位置索引 [0, 1, 2, ..., max_seq_len-1]
+        positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+        # 频率下标
+        freqs = self.theta ** (2 * torch.arange(d_k//2, device=device, dtype=torch.float32) / d_k)
+        angles = positions[:, None] / freqs[None, :]  # (max_seq_len, d_k//2)
+        sin_values = torch.sin(angles)
+        cos_values = torch.cos(angles)
+        self.register_buffer("sin_values", sin_values, persistent=False)
+        self.register_buffer("cos_values", cos_values, persistent=False)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        """
+        应用RoPE旋转到输入张量。
+        
+        参数:
+            x (torch.Tensor): 形状为 (... seq_len, d_k) 的输入张量
+            token_positions (torch.Tensor): 形状为 (... seq_len) 的token位置张量
+            
+        返回:
+            torch.Tensor: 旋转后的张量，形状与输入相同
+        """
+        # 获取输入的形状信息
+        original_shape = x.shape
+        d_k = self.d_k
+        
+        # 确保d_k是偶数
+        assert d_k % 2 == 0, f"d_k must be even, got {d_k}"
+        
+        # 重塑输入为 (... seq_len, d_k//2, 2)
+        # 这样每对相邻的元素可以作为一个2D向量进行旋转
+        x_reshaped = x.view(*original_shape[:-1], d_k // 2, 2)
+        
+        # 根据token_positions获取对应的sin和cos值
+        # token_positions的形状: (... seq_len)
+        # 需要广播到 (... seq_len, d_k//2)
+        
+        # 从预计算的缓冲区中获取sin和cos值
+        sin_vals = self.sin_values[token_positions]  # 形状: (... seq_len, d_k//2)
+        cos_vals = self.cos_values[token_positions]  # 形状: (... seq_len, d_k//2)
+        
+        # 应用2D旋转矩阵:
+        # [cos(θ)  -sin(θ)] [x1] = [x1*cos(θ) - x2*sin(θ)]
+        # [sin(θ)   cos(θ)] [x2]   [x1*sin(θ) + x2*cos(θ)]
+        
+        # 分离x1和x2（每对的第一个和第二个元素）
+        x1 = x_reshaped[..., 0]  # 形状: (... seq_len, d_k//2)
+        x2 = x_reshaped[..., 1]  # 形状: (... seq_len, d_k//2)
+        
+        # 应用旋转
+        rotated_x1 = x1 * cos_vals - x2 * sin_vals
+        rotated_x2 = x1 * sin_vals + x2 * cos_vals 
+        
+        # 重新组合旋转后的值
+        rotated_x = torch.stack([rotated_x1, rotated_x2], dim=-1)  # 形状: (... seq_len, d_k//2, 2)
+        
+        # 重塑回原始形状
+        result = rotated_x.view(original_shape)
+        
+        return result
+
+def scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys d_k"],
+    V: Float[Tensor, " ... values d_v"],
+    mask: Float[Tensor, " ... queries keys"] | None = None,
+) -> Float[Tensor, " ... queries d_v"]:
+    d_k = Q.shape[-1]
+    scale = 1 / math.sqrt(d_k)
+
+    S = scale * einsum(Q, K.transpose(-2, -1), "... q d_k, ... d_k k -> ... q k")
+    if mask is not None:
+        S = S.masked_fill(~mask, float("-inf"))
+    return einsum(softmax(S, dim=-1), V, "... q k, ... k d_v -> ... q d_v")
+
+
+def multihead_self_attention(
+    d_model: int,
+    num_heads: int,
+    q_proj_weight: Float[Tensor, " d_k d_in"],
+    k_proj_weight: Float[Tensor, " d_k d_in"],
+    v_proj_weight: Float[Tensor, " d_v d_in"],
+    o_proj_weight: Float[Tensor, " d_model d_v"],
+    in_features: Float[Tensor, " ... sequence_length d_in"],
+) -> Float[Tensor, " ... sequence_length d_out"]:
+    
+    Q = einsum(q_proj_weight, in_features,
+         "d_k d_in, ... sequence_length d_in -> ... sequence_length d_k")
+    K = einsum(k_proj_weight, in_features,
+         "d_k d_in, ... sequence_length d_in -> ... sequence_length d_k")
+    V = einsum(v_proj_weight, in_features,
+         "d_v d_in, ... sequence_length d_in -> ... sequence_length d_v")
+
+    d_k = K.shape[-1]
+    seq_len = K.shape[-2]
+    d_v = V.shape[-1]
+
+    h = num_heads
+    d_kh = d_k // h
+    d_vh = d_v // h
+
+    mask = torch.triu(torch.ones(*K.shape[:-2], seq_len, seq_len), diagonal=1).to(device=Q.device, dtype=torch.bool)
+    attns = []
+    for i in range(h):
+        attns.append(scaled_dot_product_attention(
+        Q[..., i*d_kh: min((i+1)*d_kh, d_k)], 
+        K[..., i*d_kh: min((i+1)*d_kh, d_k)], 
+        V[..., i*d_vh: min((i+1)*d_vh, d_v)], 
+        mask=~mask))
+    
+    features = torch.concat(attns, dim=-1)
+
+    return einsum(o_proj_weight, features,
+         "d_model d_v, ... sequence_length d_v -> ... sequence_length d_model")
+
+
+def multihead_self_attention_with_rope(
+    d_model: int,
+    num_heads: int,
+    max_seq_len: int,
+    theta: float,
+    q_proj_weight: Float[Tensor, " d_k d_in"],
+    k_proj_weight: Float[Tensor, " d_k d_in"],
+    v_proj_weight: Float[Tensor, " d_v d_in"],
+    o_proj_weight: Float[Tensor, " d_model d_v"],
+    in_features: Float[Tensor, " ... sequence_length d_in"],
+    token_positions: Int[Tensor, " ... sequence_length"] | None = None,
+) -> Float[Tensor, " ... sequence_length d_out"]:
+
+    Q = einsum(q_proj_weight, in_features,
+         "d_k d_in, ... sequence_length d_in -> ... sequence_length d_k")
+    K = einsum(k_proj_weight, in_features,
+         "d_k d_in, ... sequence_length d_in -> ... sequence_length d_k")
+    V = einsum(v_proj_weight, in_features,
+         "d_v d_in, ... sequence_length d_in -> ... sequence_length d_v")
+
+
+    original_shape = Q.shape
+    d_k = original_shape[-1]
+    seq_len = original_shape[-2]
+    d_v = V.shape[-1]
+
+    h = num_heads
+    d_kh = d_k // h
+    d_vh = d_v // h
+
+    max_seq_len = token_positions.max().item() + 1
+
+    # 应用RoPE
+    if token_positions is not None:
+        rope = RotaryPositionalEmbedding(
+            theta=theta,
+            d_k=d_kh,
+            max_seq_len=max_seq_len,
+            device=in_features.device
+        )
+
+        Q = Q.reshape(*Q.shape[:-2], h, seq_len, d_kh)
+        K = K.reshape(*K.shape[:-2], h, seq_len, d_kh)
+        Q = rope(Q, token_positions)
+        K = rope(K, token_positions)
+
+
+    mask = torch.triu(torch.ones(*original_shape[:-2], seq_len, seq_len), diagonal=1).to(device=Q.device, dtype=torch.bool)
+    attns = []
+    for i in range(h):
+        attns.append(scaled_dot_product_attention(
+        Q[..., i, :, :], 
+        K[..., i, :, :], 
+        V[..., i*d_vh: min((i+1)*d_vh, d_v)], 
+        mask=~mask))
+    
+    features = torch.concat(attns, dim=-1)
+
+    return einsum(o_proj_weight, features,
+         "d_model d_v, ... sequence_length d_v -> ... sequence_length d_model")
