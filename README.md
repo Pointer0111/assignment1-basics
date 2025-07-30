@@ -48,3 +48,7 @@ gunzip owt_valid.txt.gz
 cd ..
 ```
 
+## 可以优化的点
+1. 用`cppyy`优化`train_bpe`的核心操作
+2. 将MHA在head维度并行化
+
